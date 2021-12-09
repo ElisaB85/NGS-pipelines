@@ -1,0 +1,112 @@
+#!/bin/bash
+
+#$ -o /exports/eddie/scratch/ebarbier/logfiles
+#$ -e /exports/eddie/scratch/ebarbier/logfiles
+#$ -pe sharedmem 4
+#$ -l h_vmem=8G
+
+#CALLING THE VARIABLES
+echo $1 # Read project folder same
+echo $2 # name of the samples
+
+#load modules
+. /etc/profile.d/modules.sh
+module load java/jdk/1.8.0
+module load igmm/apps/FastQC/0.11.9
+module load igmm/apps/TrimGalore/0.5.0
+module load igmm/apps/cutadapt/1.16
+module load igmm/apps/bwa/0.7.16
+module load igmm/apps/samtools/1.6
+module load igmm/apps/MACS2/2.1.1
+module load anaconda/5.0.1
+module load igmm/apps/BEDTools/2.27.1
+
+#creates folders
+cd /exports/eddie/scratch/ebarbier/$1
+mkdir 1_fastq
+mkdir 4_aln
+mkdir 2_fastqc_outputs
+mkdir 5_peaks
+mkdir 3_trimmed_fastq
+mkdir 6_bam_stats
+
+mv $2_R1.fq.gz 1_fastq/
+mv $2_R2.fq.gz 1_fastq/
+
+cd /exports/eddie/scratch/ebarbier/$1/1_fastq/
+
+gunzip $2_R1.fq.gz
+gunzip $2_R2.fq.gz
+
+#PERFORMING QC OF THE SEQUENCES WITH FASTQC
+fastqc $2_R1.fq -o /exports/eddie/scratch/ebarbier/$1/2_fastqc_outputs/
+fastqc $2_R2.fq -o /exports/eddie/scratch/ebarbier/$1/2_fastqc_outputs/
+
+#TRIMMING ADAPTERS from reads
+##length might be increased based on the length of reads
+trim_galore --path_to_cutadapt cutadapt --paired -stringency 5 -length 30 -o /exports/eddie/scratch/ebarbier/$1/3_trimmed_fastq/ -q 20 $2_R1.fq $2_R2.fq
+
+cd /exports/eddie/scratch/ebarbier/$1/3_trimmed_fastq/
+
+#BWA MEM ALIGNMENT
+bwa mem -t 6 /exports/csce/eddie/biology/groups/chambers/mm10/mm10_bwa_genome/mm10bwaidx $2_R1_val_1.fq $2_R2_val_2.fq | samtools view -Sb - > /exports/eddie/scratch/ebarbier/$1/4_aln/$2_mem.bam
+
+cd /exports/eddie/scratch/ebarbier/$1/4_aln/
+
+#SORT BAM by coordinates
+samtools sort -@ 8 -T $2_mem.bam -O bam -o $2_mem_srt.bam $2_mem.bam
+
+#INDEX BAM
+samtools index $2_mem_srt.bam
+
+#REMOVE MITOCHONDRIAL READS
+samtools idxstats $2_mem_srt.bam | cut -f 1 | grep -v chrM | xargs samtools view -b $2_mem_srt.bam > $2_mem_srt_noMT.bam
+
+#APPLY Q10 FILTER STEP  and RMDUP
+samtools view -@ 8 -q 10 -b $2_mem_srt_noMT.bam > $2_mem_srt_noMT_q10.bam
+java -jar /exports/csce/eddie/biology/groups/chambers/apps/picard.jar MarkDuplicates  -I $2_mem_srt_noMT_q10.bam -O $2_mem_srt_noMT_q10_mkDup.bam -M $2_mem_srt_noMT_q10_mkDup_metrics.txt
+samtools view -h -b $2_mem_srt_noMT_q10_mkDup.bam -F 1024 > $2_mem_srt_noMT_q10_rmDup.bam
+samtools index $2_mem_srt_noMT_q10_rmDup.bam
+
+#THE FOLLOWING COMMANDS RUN THE MAIN STATS FOR THE ALN SEQUENCES
+samtools flagstat $2_mem_srt.bam > $2_mem_srt_stats.txt
+samtools flagstat $2_mem_srt_noMT.bam > $2_mem_srt_noMT_stats.txt
+samtools flagstat $2_mem_srt_noMT_q10.bam> $2_mem_srt_noMT_q10_stats.txt
+samtools flagstat $2_mem_srt_noMT_q10_rmDup.bam> $2_mem_srt_noMT_q10_rmDup_stats.txt
+
+#OFFSET MAPPED READS by þ4 bp for the þstrand and  5 bp for the  strand
+# use --ATACshift
+source activate python
+alignmentSieve --ATACshift --bam $2_mem_srt_noMT_q10_rmDup.bam -o $2_mem_srt_noMT_q10_rmDup.tmp.bam
+source deactivate python
+# the bam file needs to be sorted again
+samtools sort -@ 8 -T -O bam -o $2_mem_srt_noMT_q10_rmDup_shifted.bam $2_mem_srt_noMT_q10_rmDup.tmp.bam
+samtools index $2_mem_srt_noMT_q10_rmDup_shifted.bam
+
+#PEAK CALLING WITH MACS2
+bedtools bamtobed -i $2_mem_srt_noMT_q10_rmDup_shifted.bam > $2_mem_srt_noMT_q10_rmDup_shifted.bed
+cd /exports/eddie/scratch/ebarbier/$1/5_peaks/
+macs2 callpeak -t /exports/eddie/scratch/ebarbier/$1/4_aln/$2_mem_srt_noMT_q10_rmDup_shifted.bed -f BED -g mm -n $2_mem_srt_noMT_q10_rmDup_shifted_peaks --nomodel --shift 37 --extsize 73 -B -q 0.05
+#YOU WILL GET SEVERAL OUTPUTS IN EXEL, BED AND BEDGRAPH FORMATS, SEE HERE FOR A DESCRIPTION: https://github.com/taoliu/MACS/
+bedtools intersect -a $2_mem_srt_noMT_q10_rmDup_shifted_peaks_peaks.narrowPeaks -b /exports/csce/eddie/biology/groups/chambers/mm10_blacklist_new_srt_merged.bed -v > $2_mem_srt_noMT_q10_rmDup_shifted_peaks_peaks_nobl.bed
+
+#PRODUCE BIGWIG
+cd /exports/eddie/scratch/ebarbier/$1/4_aln/
+source activate python
+bamCoverage --bam $2_mem_srt_noMT_q10_rmDup_shifted.bam --binSize 10 --normalizeUsing RPGC --effectiveGenomeSize 2652783500 --ignoreForNormalization chrX --blackListFileName /exports/csce/eddie/biology/groups/chambers//mm10_blacklist_new_srt_merged.bed -o /exports/eddie/scratch/ebarbier/$1/5_peaks/$2_mem_srt_noMT_rmDup_shifted_normalized.bw
+##--exactScaling can be used to normalize to a specific number of reads/sample, to make all samples more comparable
+source deactivate python
+
+
+rm /exports/eddie/scratch/ebarbier/$1/4_aln/$2_mem.bam
+rm /exports/eddie/scratch/ebarbier/$1/4_aln/$2_mem_noMT.bam
+rm /exports/eddie/scratch/ebarbier/$1/4_aln/$2_mem_noMT_q10.bam
+rm /exports/eddie/scratch/ebarbier/$1/4_aln/$2_mem_noMT_q10_mkDup.bam
+rm /exports/eddie/scratch/ebarbier/$1/4_aln/$2_mem_noMT_q10_mkDup_metrics.txt
+rm /exports/eddie/scratch/ebarbier/$1/4_aln/$2_mem_srt_noMT_rmDup_shifted.bed
+rm /exports/eddie/scratch/ebarbier/$1/4_aln/$2_mem_srt_noMT_q10_rmDup.tmp.bam
+rm /exports/eddie/scratch/ebarbier/$1/4_aln/*.bdg
+gzip /exports/eddie/scratch/ebarbier/$1/1_fastq/$2_R1.fq
+gzip /exports/eddie/scratch/ebarbier/$1/1_fastq/$2_R2.fq
+gzip /exports/eddie/scratch/ebarbier/$1/3_trimmed_fastq/$2_R1_val_1.fq
+gzip /exports/eddie/scratch/ebarbier/$1/3_trimmed_fastq/$2_R2_val_2.fq
