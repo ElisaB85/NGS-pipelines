@@ -1,0 +1,25 @@
+#!/bin/bash
+
+#$ -o /exports/eddie/scratch/ebarbier/logfiles
+#$ -e /exports/eddie/scratch/ebarbier/logfiles
+#$ -l h_vmem=4G
+
+#CALLING THE VARIABLES
+echo $1 ##project folder
+echo $2 ##replicate common name
+
+#load modules
+. /etc/profile.d/modules.sh
+module load anaconda/5.0.1
+
+cd /exports/eddie/scratch/ebarbier/$1/5_peaks/
+##To use IDR (Irreproducible Discovery Rate), the narrowPeak should be sorted based on the p-value (8th column of the narrowPeak file)
+sort -k8,8nr $2_rep1_mem_srt_noMT_q10_rmDup_shifted_peaks_peaks_nobl.narrowPeak > $2_rep1_peaks_pvalue_srt.narrowPeak
+sort -k8,8nr $2_rep2_mem_srt_noMT_q10_rmDup_shifted_peaks_peaks_nobl.narrowPeak > $2_rep2_peaks_pvalue_srt.narrowPeak
+
+##Once all the narrowPeak files are sorted, we can perform IDR on the replicate of the same time-point/cell line
+
+conda activate python
+idr -s $2_rep1_peaks_pvalue_srt.narrowPeak $2_rep2_peaks_pvalue_srt.narrowPeak --input-file-type narrowPeak -o $2_pvalue_reproducible_peaks.narrowPeak --output-file-type narrowPeak --rank p.value --plot --log-output-file SAMPLE-NAME.idr.log --verbose
+
+conda deactivate python
