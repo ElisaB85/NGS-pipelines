@@ -1,0 +1,110 @@
+#!/bin/bash
+
+#$ -o /exports/eddie/scratch/ebarbier/logfiles
+#$ -e /exports/eddie/scratch/ebarbier/logfiles
+#$ -pe sharedmem 4
+#$ -l h_vmem=12G
+
+#CALLING THE VARIABLES
+echo $1 # Read project folder
+echo $2 # name of the samples
+ 
+#LOAD MODULES
+. /etc/profile.d/modules.sh
+module load java/jdk/1.8.0
+module load igmm/apps/FastQC/0.11.9
+module load igmm/apps/TrimGalore/0.5.0 
+module load igmm/apps/cutadapt/1.16 
+module load igmm/apps/STAR/2.7.1a
+module load R
+module load roslin/subread/1.5.2
+module load igmm/apps/samtools/1.6 
+module load anaconda/5.0.1
+
+#CREATE FOLDERS
+cd /exports/eddie/scratch/ebarbier/$1
+mkdir fastq
+mkdir aln
+mkdir fastqc_outputs
+mkdir peaks
+mkdir trimmed_fastq
+mkdir feature_count/
+
+mv $2_R1.fastq.gz fastq/
+mv $2_R2.fastq.gz fastq/
+
+#ENTER INTO THE FASTQ FOLDER AND UNZIP THE FILES
+cd /exports/eddie/scratch/ebarbier/$1/fastq/
+gunzip $2_R1.fastq.gz
+gunzip $2_R2.fastq.gz 
+
+#PERFORMING QC OF THE SEQUENCES WITH FASTQC
+fastqc $2_R1.fastq -o /exports/eddie/scratch/ebarbier/$1/fastqc_outputs/
+fastqc $2_R2.fastq -o /exports/eddie/scratch/ebarbier/$1/fastqc_outputs/
+
+#TRIMMING ADAPTERS from reads
+trim_galore --path_to_cutadapt cutadapt --paired -stringency 5 -length 27 -o /exports/eddie/scratch/ebarbier/$1/trimmed_fastq/ -q 20 $2_R1.fastq $2_R2.fastq 
+
+cd /exports/eddie/scratch/ebarbier/$1/trimmed_fastq/
+
+#STAR 2-PASS ALIGNMENT
+STAR --limitGenomeGenerateRAM 48000000000 --genomeDir /exports/csce/eddie/biology/groups/chambers/mm10/mm10_star_genome/ --readFilesIn $2_R1_val_1.fq $2_R2_val_2.fq --outSAMtype BAM Unsorted --quantMode TranscriptomeSAM --outFilterMultimapNmax 10 --outFilterMismatchNmax 10 --outFilterMismatchNoverLmax 0.3 --alignIntronMin 21 --alignIntronMax 0 --alignMatesGapMax 0 --alignSJoverhangMin 5 --runThreadN 12 --twopassMode Basic --twopass1readsN 60000000 --sjdbOverhang 100 --outFileNamePrefix /exports/eddie/scratch/ebarbier/$1/aln/$2.
+
+cd /exports/eddie/scratch/ebarbier/$1/aln/
+mv $2.Aligned.out.bam $2_STAR.bam
+
+#---------------------------------------------------
+#APPLY Q10 FILTER STEP AND SORT BAM by coordinates
+#ON THE ALIGNED TO GENOME
+samtools view -@ 8 -q 10 -b $2_STAR.bam | samtools sort -@ 8 -T $2_STAR -o $2_STAR_aln_to_genome_q10_srt.bam  -O bam - 
+
+#ON THE ALIGNED TO TRANSCRIPTOME (ALREADY BAM)
+samtools view -@ 8 -q 10 -b $2.Aligned.toTranscriptome.out.bam | samtools sort -@ 8 -T $2.Aligned.toTranscriptome -O bam -o $2_STAR_aln_to_transcriptome_q10_srt.bam -
+
+#THE FOLLOWING COMMANDS RUN THE MAIN STATS FOR THE ALN SEQUENCES 
+samtools flagstat $2_STAR_aln_to_genome_q10_srt.bam >  $2_STAR_aln_to_genome_q10_srt.txt
+samtools flagstat $2_STAR_aln_to_transcriptome_q10_srt.bam > $2_STAR_aln_to_transcriptome_q10_srt.txt
+
+
+#FEATURE_COUNTS
+#exons
+featureCounts -T 16 -C -s 1 -p -B -t exon -g gene_id -a /exports/csce/eddie/biology/groups/chambers/mm10/mm10.refGene.gtf -o /exports/eddie/scratch/ebarbier/$1/feature_count/$2_exon.txt $2_STAR_aln_to_genome_q10_srt.bam 
+#all_gene
+featureCounts -T 16 -C -s 1 -p -B -t transcript -g gene_id -a /exports/csce/eddie/biology/groups/chambers/mm10/mm10.refGene.gtf -o /exports/eddie/scratch/ebarbier/$1/feature_count/$2_gene.txt $2_STAR_aln_to_genome_q10_srt.bam 
+
+
+#PRODUCE BIGWIG
+#SPLIT LIBRARIES BY STRAND
+~/scripts/split_PE_bam.sh $2_STAR_aln_to_genome_q10_srt.bam  /exports/eddie/scratch/ebarbier/$1/aln/
+
+#INDEX BAM
+samtools index $2_STAR_aln_to_genome_q10_srt_fwd.bam 
+samtools index $2_STAR_aln_to_genome_q10_srt_rev.bam 
+
+#BIGWIGS:
+conda activate python
+bamCoverage --bam  /exports/eddie/scratch/ebarbier/$1/aln/$2_STAR_aln_to_genome_q10_srt_fwd.bam  --binSize 1 --normalizeUsing RPGC --effectiveGenomeSize 2652783500 --ignoreForNormalization chrX -o /exports/eddie/scratch/ebarbier/$1/peaks/$2_STAR_aln_to_genome_q10_srt_FOR.bw
+bamCoverage --bam  /exports/eddie/scratch/ebarbier/$1/aln/$2_STAR_aln_to_genome_q10_srt_rev.bam  --binSize 1 --normalizeUsing RPGC --effectiveGenomeSize 2652783500 --ignoreForNormalization chrX -o /exports/eddie/scratch/ebarbier/$1/peaks/$2_STAR_aln_to_genome_q10_srt_REV.bw
+conda deactivate
+
+
+rm $2_STAR_aln_to_genome_q10_srt_fwd1.bam 
+rm $2_STAR_aln_to_genome_q10_srt_fwd2.bam
+rm $2_STAR_aln_to_genome_q10_srt_rev1.bam 
+rm $2_STAR_aln_to_genome_q10_srt_rev2.bam
+rm $2_STAR_aln_to_genome_q10_srt_fwd.bam
+rm $2_STAR_aln_to_genome_q10_srt_rev.bam
+rm $2_STAR_aln_to_genome_q10_srt_fwd1.bam.bai 
+rm $2_STAR_aln_to_genome_q10_srt_fwd2.bam.bai 
+rm $2_STAR_aln_to_genome_q10_srt_rev1.bam.bai  
+rm $2_STAR_aln_to_genome_q10_srt_rev2.bam.bai 
+rm $2_STAR_aln_to_genome_q10_srt_fwd.bam.bai 
+rm $2_STAR_aln_to_genome_q10_srt_rev.bam.bai 
+
+
+rm $2_STAR.bam
+gzip /exports/eddie/scratch/ebarbier/$1/fastq/$2_R1.fastq
+gzip /exports/eddie/scratch/ebarbier/$1/fastq/$2_R2.fastq
+gzip /exports/eddie/scratch/ebarbier/$1/trimmed_fastq/$2_R1_val_1.fq 
+gzip /exports/eddie/scratch/ebarbier/$1/trimmed_fastq/$2_R2_val_2.fq
+
